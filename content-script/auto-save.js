@@ -2,206 +2,166 @@
   if (window.__summarizeAutoSaveLoaded) return;
   window.__summarizeAutoSaveLoaded = true;
 
-  // Keys/patterns that are definitely NOT summary content
-  const SKIP_PATTERNS = [
-    /^#/, // CSS selectors
-    /\{\s*display\s*:/, // CSS rules
-    /background-color/, // CSS
-    /border-radius/, // CSS
-    /^_summary/, // our own history key prefix
-    /^settings/, // settings objects
-    /^config/, // config objects
-    /^theme/, // theme data
+  // ── STEP 1: Intercept navigator.clipboard.writeText ──────────────────────────
+  // The extension's copy button calls navigator.clipboard.writeText(summaryText).
+  // We wrap that function so every clipboard write is also sent for download.
+  // This is the most reliable method — we get the exact text the copy button copies.
+
+  const _originalWriteText = navigator.clipboard.writeText.bind(navigator.clipboard);
+
+  navigator.clipboard.writeText = function (text) {
+    // Fire the original so copy still works normally
+    const result = _originalWriteText(text);
+    // Only download if it looks like a real summary (not a URL, short string, etc.)
+    if (text && text.length > 100 && looksLikeSummary(text)) {
+      triggerDownload(text);
+    }
+    return result;
+  };
+
+  // ── STEP 2: Also intercept document.execCommand('copy') for older fallbacks ──
+  const _origExecCommand = document.execCommand.bind(document);
+  document.execCommand = function (cmd, ...args) {
+    if (cmd === 'copy') {
+      // Give the browser a tick to populate the clipboard, then read it
+      setTimeout(() => {
+        navigator.clipboard.readText && navigator.clipboard.readText().then(text => {
+          if (text && text.length > 100 && looksLikeSummary(text)) {
+            triggerDownload(text);
+          }
+        }).catch(() => {});
+      }, 100);
+    }
+    return _origExecCommand(cmd, ...args);
+  };
+
+  // ── STEP 3: Auto-click the copy button when streaming finishes ────────────────
+  // We watch for the extension's copy button to appear and become stable,
+  // then programmatically click it. This fires writeText which we intercept above.
+
+  let lastAutoClickText = null;
+  let settleTimer = null;
+  let streamCheckTimer = null;
+
+  // Known selectors for the copy button in the ChatGPT Summarize extension
+  // The extension renders a panel with a copy icon button
+  const COPY_BTN_SELECTORS = [
+    'button[title*="Copy"]',
+    'button[aria-label*="Copy"]',
+    'button[aria-label*="copy"]',
+    'button[title*="copy"]',
+    '[data-testid*="copy"]',
+    'button svg[class*="copy"]',         // button containing a copy SVG
+    'button[class*="copy"]',
+    'button[class*="Copy"]',
+    'button[class*="clipboard"]',
+    // The extension panel is a fixed overlay — look inside it
+    '[class*="SummaryPanel"] button',
+    '[class*="summaryPanel"] button',
+    '[class*="summary-panel"] button',
+    '[class*="Panel"] button[class*="icon"]',
+    '[id*="summarize"] button',
   ];
 
-  // A summary result must look like natural language prose/bullets
-  function looksLikeSummary(text) {
-    if (typeof text !== 'string') return false;
-    if (text.length < 100) return false;
-    // Skip anything that looks like CSS or code
-    if (SKIP_PATTERNS.some(p => p.test(text.slice(0, 120)))) return false;
-    // Must have spaces between words (not minified code/CSS)
-    const wordRatio = (text.match(/[a-zA-Z]{3,}/g) || []).length / (text.length / 10);
-    if (wordRatio < 0.5) return false;
-    // Should not be mostly special characters
-    const specialRatio = (text.match(/[{}\[\]();:<>]/g) || []).length / text.length;
-    if (specialRatio > 0.08) return false;
-    return true;
-  }
-
-  // ── STORAGE WATCHER ──────────────────────────────────────────────────────────
-  let lastStorageKey = null;
-
-  function checkStorage() {
-    chrome.storage.local.get(null, function (items) {
-      if (chrome.runtime.lastError) return;
-
-      // Look for keys that store summary objects: { result, summary, content, answer, text }
-      // and have a recent-ish timestamp
-      let best = null;
-      let bestTime = 0;
-
-      for (let key of Object.keys(items)) {
-        // Skip our own meta keys
-        if (key === '_summaryHistory') continue;
-
-        const val = items[key];
-
-        // Case 1: object with a known summary field
-        if (val && typeof val === 'object' && !Array.isArray(val)) {
-          for (let field of ['summary', 'result', 'content', 'answer', 'text', 'output']) {
-            const candidate = val[field];
-            if (looksLikeSummary(candidate)) {
-              const t = val.timestamp || val.updatedAt || val.createdAt || 0;
-              const ts = typeof t === 'string' ? new Date(t).getTime() || 1 : (t || 1);
-              if (ts >= bestTime) {
-                bestTime = ts;
-                best = { key: key + '::' + field, text: candidate };
-              }
-            }
-          }
-        }
-
-        // Case 2: plain string value
-        if (looksLikeSummary(val)) {
-          if (1 >= bestTime) {
-            bestTime = 1;
-            best = { key, text: val };
-          }
-        }
-      }
-
-      if (best && best.key !== lastStorageKey) {
-        lastStorageKey = best.key;
-        triggerDownload(best.text, 'storage');
-      }
-    });
-  }
-
-  // ── DOM WATCHER ──────────────────────────────────────────────────────────────
-  // The extension renders a panel. We watch for it to *stop changing* (stream done).
-  let domSettleTimer = null;
-  let lastDomText = null;
-  let streamingCheckTimer = null;
-
-  // Selectors used by the ChatGPT Summarize extension panel
-  const PANEL_SELECTORS = [
-    '[data-testid="summary-result"]',
-    '[class*="summaryContent"]',
-    '[class*="summary-content"]',
-    '[class*="SummaryPanel"]',
-    '[class*="resultText"]',
-    '[class*="summary_content"]',
-    '[id*="summarize-result"]',
-    '[id*="summary-result"]',
-    // The extension appends a fixed overlay with a specific structure
-    'div[class*="Panel"] p',
-    'div[class*="panel"] li',
-  ];
-
-  function getPanelText() {
-    // Try direct selectors first
-    for (let sel of PANEL_SELECTORS) {
+  function findCopyButton() {
+    for (let sel of COPY_BTN_SELECTORS) {
       try {
-        const els = document.querySelectorAll(sel);
-        if (els.length > 0) {
-          let combined = Array.from(els).map(e => e.innerText || '').join('\n').trim();
-          if (looksLikeSummary(combined)) return combined;
+        const btns = Array.from(document.querySelectorAll(sel));
+        for (let btn of btns) {
+          const label = (btn.getAttribute('title') || btn.getAttribute('aria-label') || btn.innerText || '').toLowerCase();
+          if (label.includes('copy') || btn.querySelector('svg')) {
+            // Make sure it's visible
+            const rect = btn.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) return btn;
+          }
         }
       } catch (e) {}
     }
 
     // Fallback: scan shadow roots
-    let best = '';
+    let found = null;
     document.querySelectorAll('*').forEach(el => {
+      if (found) return;
       if (el.shadowRoot) {
-        el.shadowRoot.querySelectorAll('*').forEach(child => {
-          if (child.childElementCount === 0) {
-            const t = (child.innerText || '').trim();
-            if (t.length > best.length) best = t;
-          }
+        el.shadowRoot.querySelectorAll('button').forEach(btn => {
+          if (found) return;
+          const label = (btn.getAttribute('title') || btn.getAttribute('aria-label') || btn.innerText || '').toLowerCase();
+          if (label.includes('copy')) found = btn;
         });
       }
     });
-    if (looksLikeSummary(best)) return best;
-
-    // Last resort: look for the largest visible text block in the top-right quadrant
-    // (where the extension panel renders)
-    let largest = '';
-    document.querySelectorAll('div, section, article').forEach(el => {
-      try {
-        const rect = el.getBoundingClientRect();
-        // Panel is typically in the right half of the viewport
-        if (rect.left < window.innerWidth * 0.5) return;
-        if (rect.width < 200 || rect.height < 100) return;
-        const t = (el.innerText || '').trim();
-        if (t.length > largest.length && looksLikeSummary(t)) largest = t;
-      } catch (e) {}
-    });
-    return largest || null;
+    return found;
   }
 
-  // Detect whether streaming is still in progress
-  // The extension shows a spinner/cursor while streaming
   function isStreaming() {
-    const streamingIndicators = [
-      document.querySelector('[class*="streaming"]'),
-      document.querySelector('[class*="Streaming"]'),
-      document.querySelector('[class*="loading"]'),
-      document.querySelector('[class*="Loading"]'),
-      document.querySelector('[class*="spinner"]'),
-      document.querySelector('[class*="Spinner"]'),
-      document.querySelector('[class*="cursor"]'),
-      document.querySelector('[class*="typingIndicator"]'),
-      document.querySelector('span[class*="blink"]'),
+    // Look for any streaming/loading indicator in the DOM or shadow roots
+    const sel = [
+      '[class*="streaming"]', '[class*="Streaming"]',
+      '[class*="loading"]',   '[class*="Loading"]',
+      '[class*="spinner"]',   '[class*="Spinner"]',
+      '[class*="typingCursor"]', '[class*="blink"]',
+      '[class*="generating"]',
     ];
-    return streamingIndicators.some(Boolean);
+    return sel.some(s => { try { return !!document.querySelector(s); } catch { return false; } });
   }
 
-  function tryCaptureDom() {
+  function attemptAutoClick() {
     if (isStreaming()) {
-      // Still streaming — check again in 1s
-      clearTimeout(streamingCheckTimer);
-      streamingCheckTimer = setTimeout(tryCaptureDom, 1000);
+      clearTimeout(streamCheckTimer);
+      streamCheckTimer = setTimeout(attemptAutoClick, 1200);
       return;
     }
 
-    const text = getPanelText();
-    if (text && text !== lastDomText && looksLikeSummary(text)) {
-      lastDomText = text;
-      triggerDownload(text, 'dom');
-    }
+    const btn = findCopyButton();
+    if (!btn) return;
+
+    // Avoid double-clicking for same result
+    const nearbyText = btn.closest('[class*="Panel"], [class*="panel"], [id*="summarize"]');
+    const panelText = nearbyText ? (nearbyText.innerText || '').trim() : '';
+    if (panelText && panelText === lastAutoClickText) return;
+    if (panelText) lastAutoClickText = panelText;
+
+    btn.click();
   }
 
-  // MutationObserver: debounce 2.5s after last DOM change, then check
+  // MutationObserver: debounce 2.5s after last DOM mutation, then try auto-click
   const observer = new MutationObserver(() => {
-    clearTimeout(domSettleTimer);
-    // Wait 2.5 seconds of no DOM changes = streaming likely done
-    domSettleTimer = setTimeout(tryCaptureDom, 2500);
+    clearTimeout(settleTimer);
+    settleTimer = setTimeout(attemptAutoClick, 2500);
   });
 
   observer.observe(document.body, { childList: true, subtree: true, characterData: true });
 
-  // ── DOWNLOAD TRIGGER ────────────────────────────────────────────────────────
+  // ── HELPERS ──────────────────────────────────────────────────────────────────
+  function looksLikeSummary(text) {
+    if (typeof text !== 'string' || text.length < 100) return false;
+    // Reject CSS
+    if (/^#[a-zA-Z]|\{\s*\n?\s*(display|background|color|border|padding|margin)/.test(text)) return false;
+    // Reject mostly special chars (minified code)
+    const specialRatio = (text.match(/[{}\[\]();:<>]/g) || []).length / text.length;
+    if (specialRatio > 0.07) return false;
+    // Must have enough word-like tokens
+    const words = (text.match(/[a-zA-Z]{3,}/g) || []).length;
+    if (words < 15) return false;
+    return true;
+  }
+
   let lastDownloadedText = null;
 
-  function triggerDownload(text, source) {
+  function triggerDownload(text) {
     if (!text || text === lastDownloadedText) return;
-    if (!looksLikeSummary(text)) return;
     lastDownloadedText = text;
-
     chrome.runtime.sendMessage(
-      { type: 'SUMMARY_AUTO_DOWNLOAD', text: text },
+      { type: 'SUMMARY_AUTO_DOWNLOAD', text },
       function (response) {
         if (chrome.runtime.lastError) {
-          setTimeout(() => triggerDownload(text, source + '_retry'), 3000);
+          setTimeout(() => {
+            lastDownloadedText = null; // allow retry
+            triggerDownload(text);
+          }, 3000);
         }
       }
     );
   }
-
-  // Poll storage every 4 seconds as reliable fallback
-  setInterval(checkStorage, 4000);
-  setTimeout(checkStorage, 3000);
 
 })();

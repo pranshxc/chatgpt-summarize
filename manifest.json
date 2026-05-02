@@ -20,7 +20,8 @@
     "contextMenus",
     "unlimitedStorage",
     "alarms",
-    "webRequest"
+    "webRequest",
+    "downloads"
   ],
   "optional_host_permissions": ["file://*/*"],
   "content_security_policy": {

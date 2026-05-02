@@ -2,17 +2,19 @@
   if (window.__summarizeAutoSaveLoaded) return;
   window.__summarizeAutoSaveLoaded = true;
 
-  // ── CLIPBOARD INTERCEPTION ────────────────────────────────────────────────
-  // We wrap writeText so that whenever the copy button is clicked (by user OR
-  // by us auto-clicking it), we capture the exact text and download it.
+  console.log('[AutoSave] loaded ✓');
 
+  // ── CLIPBOARD INTERCEPT ────────────────────────────────────────────────
   let lastDownloadedText = null;
 
   const _origWriteText = navigator.clipboard.writeText.bind(navigator.clipboard);
   navigator.clipboard.writeText = function (text) {
+    console.log('[AutoSave] clipboard.writeText intercepted, length:', text && text.length, 'preview:', text && text.slice(0, 80));
     const result = _origWriteText(text);
     if (text && text.length > 100 && !text.startsWith('#') && countWords(text) > 15) {
       scheduleDownload(text);
+    } else {
+      console.log('[AutoSave] skipped (too short or looks like CSS)');
     }
     return result;
   };
@@ -22,94 +24,107 @@
   }
 
   function scheduleDownload(text) {
-    if (text === lastDownloadedText) return;
+    if (text === lastDownloadedText) { console.log('[AutoSave] skipped duplicate'); return; }
     lastDownloadedText = text;
-    chrome.runtime.sendMessage({ type: 'SUMMARY_AUTO_DOWNLOAD', text }, function () {
+    console.log('[AutoSave] sending download message...');
+    chrome.runtime.sendMessage({ type: 'SUMMARY_AUTO_DOWNLOAD', text }, function (resp) {
       if (chrome.runtime.lastError) {
-        // Background woke up late — retry once
+        console.warn('[AutoSave] sendMessage error:', chrome.runtime.lastError.message);
         lastDownloadedText = null;
         setTimeout(() => scheduleDownload(text), 2500);
+      } else {
+        console.log('[AutoSave] download triggered ✓', resp);
       }
     });
   }
 
-  // ── BUTTON WATCHER ────────────────────────────────────────────────────────
-  // The extension renders 3 action buttons (copy / rewrite / info) at the
-  // bottom of the summary panel ONLY after the stream finishes.
-  // We detect when these appear, find the copy button among them, and click it.
-  //
-  // From the screenshot the panel is a fixed overlay on the right side.
-  // The buttons are small SVG-icon buttons grouped together.
+  // ── BUTTON SCAN ───────────────────────────────────────────────────────────
 
   let autoClickDone = false;
-  let scanTimer = null;
 
-  function findActionButtons() {
-    // Strategy: find groups of 2-4 small icon-buttons that are visible and
-    // positioned in the right half of the viewport (where the panel lives).
-    // The copy button is always one of them.
+  function getAllButtons() {
+    const buttons = [];
 
-    const allButtons = Array.from(document.querySelectorAll('button'));
-    const panelButtons = allButtons.filter(btn => {
-      const rect = btn.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) return false;
-      if (rect.width > 60 || rect.height > 60) return false; // icon buttons are small
-      if (rect.left < window.innerWidth * 0.45) return false; // right-side panel
-      return true;
-    });
+    // Regular DOM buttons
+    document.querySelectorAll('button').forEach(b => buttons.push({ btn: b, source: 'dom' }));
 
-    if (panelButtons.length < 2) return null; // need at least 2 of the 3 buttons
-
-    // Among these, find the copy button by aria-label, title, or SVG content
-    const copyBtn = panelButtons.find(btn => {
-      const label = (
-        (btn.getAttribute('aria-label') || '') +
-        (btn.getAttribute('title') || '') +
-        (btn.getAttribute('data-tooltip') || '') +
-        (btn.innerText || '')
-      ).toLowerCase();
-      if (label.includes('copy')) return true;
-      // Check SVG path data — copy icons typically have a rect+path pattern
-      const svg = btn.querySelector('svg');
-      if (svg) {
-        const paths = svg.querySelectorAll('path, rect');
-        if (paths.length >= 2) return true; // copy icon has 2 shapes
+    // Shadow DOM buttons
+    document.querySelectorAll('*').forEach(el => {
+      if (el.shadowRoot) {
+        el.shadowRoot.querySelectorAll('button').forEach(b => buttons.push({ btn: b, source: 'shadow' }));
       }
-      return false;
     });
 
-    return copyBtn || panelButtons[0]; // fallback to first button in group
+    return buttons;
   }
 
   function tryScan() {
     if (autoClickDone) return;
 
-    const btn = findActionButtons();
-    if (!btn) return; // buttons not visible yet
+    const allBtns = getAllButtons();
 
-    autoClickDone = true;
-    clearInterval(scanInterval);
+    // Log ALL visible buttons in the right half so we can identify them
+    const panelBtns = allBtns.filter(({ btn }) => {
+      const r = btn.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 && r.left > window.innerWidth * 0.4;
+    });
 
-    // Small delay to make sure the panel text is fully rendered
-    setTimeout(() => {
-      btn.click();
-    }, 300);
+    if (panelBtns.length > 0) {
+      console.log('[AutoSave] visible right-side buttons:',
+        panelBtns.map(({ btn, source }) => ({
+          source,
+          tag: btn.tagName,
+          class: btn.className,
+          id: btn.id,
+          title: btn.getAttribute('title'),
+          ariaLabel: btn.getAttribute('aria-label'),
+          dataTooltip: btn.getAttribute('data-tooltip'),
+          text: btn.innerText.trim().slice(0, 30),
+          svgCount: btn.querySelectorAll('svg').length,
+          x: Math.round(btn.getBoundingClientRect().left),
+          y: Math.round(btn.getBoundingClientRect().top),
+          w: Math.round(btn.getBoundingClientRect().width),
+          h: Math.round(btn.getBoundingClientRect().height),
+        }))
+      );
+    }
+
+    // Try to find copy button
+    const copyBtn = allBtns.find(({ btn }) => {
+      const r = btn.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return false;
+      const label = [
+        btn.getAttribute('aria-label') || '',
+        btn.getAttribute('title') || '',
+        btn.getAttribute('data-tooltip') || '',
+        btn.innerText || '',
+      ].join(' ').toLowerCase();
+      return label.includes('copy');
+    });
+
+    if (copyBtn) {
+      console.log('[AutoSave] found copy button! clicking...', copyBtn.btn.className, copyBtn.source);
+      autoClickDone = true;
+      clearInterval(scanInterval);
+      setTimeout(() => copyBtn.btn.click(), 200);
+    }
   }
 
-  // Poll every 500ms — as soon as buttons appear we click immediately
-  const scanInterval = setInterval(tryScan, 500);
+  const scanInterval = setInterval(tryScan, 800);
 
-  // Reset autoClickDone when the panel closes/re-opens for a new summary
-  // We detect this by watching for the buttons to disappear then reappear
-  let buttonsWereVisible = false;
-  const resetInterval = setInterval(() => {
-    const btn = findActionButtons();
-    if (!btn && buttonsWereVisible) {
-      // Panel closed or new summary started
+  // Reset when panel re-opens
+  let hadButtons = false;
+  setInterval(() => {
+    const has = getAllButtons().some(({ btn }) => {
+      const r = btn.getBoundingClientRect();
+      return r.width > 0 && r.left > window.innerWidth * 0.4;
+    });
+    if (!has && hadButtons) {
       autoClickDone = false;
-      buttonsWereVisible = false;
+      hadButtons = false;
+      console.log('[AutoSave] panel closed, reset');
     }
-    if (btn) buttonsWereVisible = true;
-  }, 1000);
+    if (has) hadButtons = true;
+  }, 1500);
 
 })();

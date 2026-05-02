@@ -28,8 +28,8 @@
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
   },
   "background": {
-    "service_worker": "background/index.js",
-    "scripts": ["background/auto-save-handler.js"]
+    "service_worker": "background/sw-entry.js",
+    "type": "module"
   },
   "action": {
     "default_icon": {

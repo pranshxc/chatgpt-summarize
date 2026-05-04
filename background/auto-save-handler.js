@@ -3,24 +3,15 @@
 // 2. Watches chrome.storage.onChanged for the key the extension uses to save summaries
 
 // ── Storage watcher ──────────────────────────────────────────────────────────
-// The ChatGPT Summarize extension saves the AI response to chrome.storage.
-// We watch every storage change and log the key + value preview so we can
-// identify the exact key, then download it.
-
 chrome.storage.onChanged.addListener(function (changes, area) {
   for (const key of Object.keys(changes)) {
     const { oldValue, newValue } = changes[key];
-
-    // Log every change so we can identify the summary key
     const preview = typeof newValue === 'string'
       ? newValue.slice(0, 120)
       : (newValue && typeof newValue === 'object'
           ? JSON.stringify(newValue).slice(0, 120)
           : String(newValue));
-
     console.log('[AutoSave][storage.onChanged]', area, 'key:', key, '| preview:', preview);
-
-    // Check if this looks like a real summary
     const text = extractSummaryText(newValue);
     if (text && text !== extractSummaryText(oldValue)) {
       console.log('[AutoSave] Detected summary in key:', key, '- triggering download');
@@ -31,18 +22,13 @@ chrome.storage.onChanged.addListener(function (changes, area) {
 
 function extractSummaryText(val) {
   if (!val) return null;
-
-  // Plain string
   if (typeof val === 'string') {
     return looksLikeSummary(val) ? val : null;
   }
-
-  // Object with known summary fields
   if (typeof val === 'object') {
     for (const field of ['summary', 'result', 'content', 'answer', 'text', 'output', 'response', 'message']) {
       if (looksLikeSummary(val[field])) return val[field];
     }
-    // Nested: { data: { summary: '...' } }
     for (const sub of Object.values(val)) {
       if (sub && typeof sub === 'object') {
         for (const field of ['summary', 'result', 'content', 'answer', 'text', 'output']) {
@@ -57,18 +43,32 @@ function extractSummaryText(val) {
 function looksLikeSummary(text) {
   if (typeof text !== 'string') return false;
   if (text.length < 150) return false;
-  // Reject CSS / code
   if (/^[\s]*[#.\[\*@]/.test(text.slice(0, 10))) return false;
   if ((text.match(/[{}();]/g) || []).length / text.length > 0.06) return false;
-  // Must have enough English words
   return (text.match(/[a-zA-Z]{4,}/g) || []).length > 20;
 }
 
-// ── Message handler (from content script) ────────────────────────────────────
+// ── Message handler ───────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
+  // Auto-download trigger from content script
   if (message && message.type === 'SUMMARY_AUTO_DOWNLOAD' && message.text) {
     doDownload(message.text, sender, sendResponse);
     return true;
+  }
+
+  // Cookie fetch for DeepSeek login — chrome.cookies only works in background SW
+  if (message && message.type === 'GET_DEEPSEEK_COOKIES') {
+    chrome.cookies.getAll({ domain: 'chat.deepseek.com' }, function (cookies) {
+      if (chrome.runtime.lastError || !cookies || cookies.length === 0) {
+        console.warn('[DeepSeek] No cookies found for chat.deepseek.com');
+        sendResponse({ cookieStr: null });
+        return;
+      }
+      const cookieStr = cookies.map(c => c.name + '=' + c.value).join('; ');
+      console.log('[DeepSeek] Sending', cookies.length, 'cookies to popup');
+      sendResponse({ cookieStr });
+    });
+    return true; // keep message channel open for async sendResponse
   }
 });
 
@@ -90,11 +90,10 @@ function doDownload(text, sender, sendResponse) {
     function (downloadId) {
       if (chrome.runtime.lastError) {
         console.warn('[AutoSave] Download failed:', chrome.runtime.lastError.message);
-        lastDownloadedText = null; // allow retry
+        lastDownloadedText = null;
         sendResponse && sendResponse({ success: false, error: chrome.runtime.lastError.message });
       } else {
         console.log('[AutoSave] Saved:', filename, '| ID:', downloadId);
-        // Save to history
         chrome.storage.local.get(['_summaryHistory'], function (res) {
           const history = res._summaryHistory || [];
           history.unshift({ timestamp, text: text.slice(0, 500), url: (sender && sender.url) || '' });

@@ -12,15 +12,23 @@ async function safeJson(response){
   catch(e){console.error("[safeJson] JSON parse failed:",text.slice(0,300));throw new Error("Server returned invalid response")}
 }
 
-async function getDeepSeekCookies(){
-  try{
-    const cookies=await chrome.cookies.getAll({domain:"chat.deepseek.com"});
-    if(!cookies||cookies.length===0)return null;
-    return cookies.map(c=>c.name+"="+c.value).join("; ");
-  }catch(e){
-    console.warn("[DeepSeek] Could not read cookies:",e);
-    return null;
-  }
+// Must go through background SW because chrome.cookies is only available there
+function getDeepSeekCookies(){
+  return new Promise(resolve=>{
+    try{
+      chrome.runtime.sendMessage({type:"GET_DEEPSEEK_COOKIES"},response=>{
+        if(chrome.runtime.lastError){
+          console.warn("[DeepSeek] sendMessage error:",chrome.runtime.lastError.message);
+          resolve(null);
+          return;
+        }
+        resolve(response?.cookieStr||null);
+      });
+    }catch(e){
+      console.warn("[DeepSeek] getDeepSeekCookies failed:",e);
+      resolve(null);
+    }
+  });
 }
 
 async function C(e,t){
@@ -49,7 +57,6 @@ async function A(e,t){
       e=o["deepseek-login"],t=o["deepseek-password"]
     }
 
-    // Get existing DeepSeek browser cookies to pass WAF bot check
     const cookieStr=await getDeepSeekCookies();
     console.log("[DeepSeek] cookies found:",cookieStr?"yes (length "+cookieStr.length+")":"none");
 
@@ -60,7 +67,6 @@ async function A(e,t){
       "x-client-platform":"web",
       "x-client-locale":"en_US"
     };
-    // Only set Cookie header if we have cookies — omitting Origin avoids extension URL leaking
     if(cookieStr)headers["Cookie"]=cookieStr;
 
     let r=await fetch(P.loginUrl,{
@@ -76,7 +82,16 @@ async function A(e,t){
 
     // Detect WAF/bot challenge: non-JSON HTML body
     if(n&&n.__rawHtml__!==undefined){
-      return{error:"DeepSeek is blocking this request (bot/WAF protection).\n\nTo fix: open https://chat.deepseek.com in your browser, log in once there, then try again here. The extension needs your browser session cookies to authenticate."}}
+      return{error:"DeepSeek is blocking this request (bot protection).\n\nPlease open https://chat.deepseek.com in your browser, log in there first, then try again here."}
+    }
+
+    // Blank body — WAF challenge with empty response
+    if(n===null){
+      if(!cookieStr){
+        return{error:"DeepSeek requires browser cookies to authenticate.\n\nPlease: 1) Open https://chat.deepseek.com in a tab, 2) Log in there, 3) Come back and try again here."}
+      }
+      return{error:`Login returned empty response (${r.status}). DeepSeek may be rate-limiting or blocking this request. Please wait a moment and try again.`}
+    }
 
     if(!r.ok){
       return{error:n?.error||n?.detail?.message||n?.message||`Login failed (${r.status}). Please check your credentials.`}
@@ -87,9 +102,8 @@ async function A(e,t){
       await f.default.storage.local.set({"deepseek-token":o,"deepseek-login":e,"deepseek-password":t});
       return{token:o}
     }else{
-      // r.ok but no user data — could be 2FA or unexpected shape
-      console.warn("[DeepSeek] ok but no user in response:",JSON.stringify(n).slice(0,200));
-      return{error:n?.error||n?.message||`Login succeeded (${r.status}) but no session returned. Check if 2FA is enabled on your account.`}
+      console.warn("[DeepSeek] ok but unexpected response shape:",JSON.stringify(n).slice(0,300));
+      return{error:n?.error||n?.message||`Unexpected response from DeepSeek (${r.status}). Raw: `+JSON.stringify(n).slice(0,150)}
     }
   }catch(r){
     return console.error("Login error",r),{error:r?.message||"An error occurred during login"}

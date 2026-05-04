@@ -21,7 +21,8 @@
     "unlimitedStorage",
     "alarms",
     "webRequest",
-    "downloads"
+    "downloads",
+    "cookies"
   ],
   "optional_host_permissions": ["file://*/*"],
   "content_security_policy": {

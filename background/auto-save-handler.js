@@ -1,9 +1,6 @@
 // Auto-download handler
 // 1. Receives SUMMARY_AUTO_DOWNLOAD message from content script (manual trigger)
 // 2. Watches chrome.storage.onChanged for the key the extension uses to save summaries
-// 3. Handles DEEPSEEK_TOKEN_FROM_PAGE — saves token extracted from DeepSeek's localStorage
-// 4. Handles DEEPSEEK_LOGIN — legacy path with WAF diagnostics
-// 5. Handles GET_DEEPSEEK_COOKIES — legacy cookie fetch
 
 // ── Storage watcher ──────────────────────────────────────────────────────────
 chrome.storage.onChanged.addListener(function (changes, area) {
@@ -51,7 +48,93 @@ function looksLikeSummary(text) {
   return (text.match(/[a-zA-Z]{4,}/g) || []).length > 20;
 }
 
-// ── DeepSeek cookie helper (used by legacy GET_DEEPSEEK_COOKIES) ───────────────
+// ── DeepSeek token extraction via tab injection ───────────────────────────────────
+//
+// WHY THIS APPROACH:
+// DeepSeek's login API endpoint is protected by AWS CloudFront WAF.
+// It returns HTTP 200 with empty body + x-amzn-waf-action: challenge for ANY
+// non-browser request (including from extension service workers), regardless
+// of cookies or headers sent. There is no way to bypass this at the network level.
+//
+// SOLUTION: Instead of calling the login API, we inject a tiny script into the
+// user's existing chat.deepseek.com tab and read the auth token directly from
+// DeepSeek's own localStorage. DeepSeek stores the token there after login.
+// This completely avoids the WAF because we never make the login network request.
+
+async function extractDeepSeekTokenFromTab() {
+  // Find an open DeepSeek tab
+  const tabs = await chrome.tabs.query({ url: 'https://chat.deepseek.com/*' });
+
+  if (!tabs || tabs.length === 0) {
+    return { error: 'no_tab' };
+  }
+
+  const tab = tabs[0];
+
+  try {
+    // Inject into the DeepSeek tab and read localStorage
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        try {
+          // DeepSeek stores auth state in localStorage under various keys
+          // Try all known key patterns
+          const candidates = [
+            'userToken',
+            'token',
+            'accessToken',
+            'access_token',
+            'authToken',
+            'auth_token',
+            'ds_token',
+          ];
+
+          // Direct key lookup
+          for (const key of candidates) {
+            const val = localStorage.getItem(key);
+            if (val && val.length > 20) return { token: val, source: key };
+          }
+
+          // Scan all localStorage keys for anything that looks like a JWT or token
+          for (let i = 0; i < localStorage.length; i++) {
+            const key = localStorage.key(i);
+            const val = localStorage.getItem(key);
+            if (!val) continue;
+
+            // JWT pattern: three base64 segments separated by dots
+            if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(val)) {
+              return { token: val, source: key };
+            }
+
+            // Try JSON values that might contain a token field
+            if (val.startsWith('{')) {
+              try {
+                const parsed = JSON.parse(val);
+                for (const field of ['token', 'access_token', 'accessToken', 'userToken', 'authToken']) {
+                  if (parsed[field] && typeof parsed[field] === 'string' && parsed[field].length > 20) {
+                    return { token: parsed[field], source: `${key}.${field}` };
+                  }
+                }
+              } catch {}
+            }
+          }
+
+          return { error: 'not_found', keysScanned: localStorage.length };
+        } catch (e) {
+          return { error: 'script_error', message: e.message };
+        }
+      },
+    });
+
+    const result = results?.[0]?.result;
+    if (!result) return { error: 'no_result' };
+    return result;
+  } catch (e) {
+    return { error: 'injection_failed', message: e.message };
+  }
+}
+
+// ── Cookie helper (kept for GET_DEEPSEEK_COOKIES legacy compat) ─────────────────
 async function getDeepSeekCookieStr() {
   const urls = [
     'https://chat.deepseek.com',
@@ -78,25 +161,9 @@ async function getDeepSeekCookieStr() {
 
 // ── Message handler ──────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
-
-  // Auto-download trigger
+  // Auto-download trigger from content script
   if (message && message.type === 'SUMMARY_AUTO_DOWNLOAD' && message.text) {
     doDownload(message.text, sender, sendResponse);
-    return true;
-  }
-
-  // ★ PRIMARY PATH: Token extracted directly from DeepSeek's localStorage by content script
-  // No API call, no WAF, no cookies needed. Works as long as user is logged in on chat.deepseek.com.
-  if (message && message.type === 'DEEPSEEK_TOKEN_FROM_PAGE') {
-    const { token } = message;
-    if (!token || token.length < 20) {
-      sendResponse({ saved: false, error: 'Invalid token received from page' });
-      return true;
-    }
-    chrome.storage.local.set({ 'deepseek-token': token }, () => {
-      console.log('[DeepSeek] Token saved from page localStorage. Length:', token.length);
-      sendResponse({ saved: true });
-    });
     return true;
   }
 
@@ -108,39 +175,55 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
     return true;
   }
 
-  // Legacy: full background login attempt (WAF-blocked, kept for diagnostics)
+  // DEEPSEEK_LOGIN: extract token from open tab instead of calling blocked API
   if (message && message.type === 'DEEPSEEK_LOGIN') {
     (async () => {
-      try {
-        const { email, password } = message;
+      const { email, password } = message;
 
-        // First, check if we already have a token saved from the page bridge
-        const stored = await chrome.storage.local.get({ 'deepseek-token': '' });
-        if (stored['deepseek-token'] && stored['deepseek-token'].length > 20) {
-          console.log('[DeepSeek] Using existing token from page bridge, skipping login API call.');
-          sendResponse({ token: stored['deepseek-token'] });
-          return;
-        }
+      console.log('[DeepSeek] Login requested — attempting tab-based token extraction');
 
-        // No page-bridge token available — instruct user to log in on the site
-        // (Direct API login is blocked by DeepSeek CloudFront WAF regardless of headers/cookies)
-        const cookieStr = await getDeepSeekCookieStr();
-        if (!cookieStr) {
-          sendResponse({
-            error: 'DeepSeek requires you to log in via the browser.\n\nPlease:\n1) Open https://chat.deepseek.com in a tab\n2) Log in there\n3) Come back and try again — the extension will automatically pick up your session.',
-            diagnostic: { reason: 'no_page_token_no_cookies' },
-          });
-          return;
-        }
+      const result = await extractDeepSeekTokenFromTab();
 
-        // Has cookies but no page token yet — user may be logged in but token bridge hasn\'t run
-        sendResponse({
-          error: 'Your DeepSeek session was detected but the token bridge has not run yet.\n\nPlease:\n1) Make sure https://chat.deepseek.com is open in a tab\n2) Refresh that tab\n3) Try again here',
-          diagnostic: { reason: 'cookies_but_no_page_token', cookieCount: cookieStr.split(';').length },
+      if (result && result.token) {
+        console.log('[DeepSeek] Token extracted from tab localStorage via key:', result.source);
+        await chrome.storage.local.set({
+          'deepseek-token': result.token,
+          'deepseek-login': email,
+          'deepseek-password': password,
         });
-      } catch (err) {
-        sendResponse({ error: err?.message || 'DeepSeek login failed' });
+        sendResponse({ token: result.token });
+        return;
       }
+
+      // Tab not found — user hasn't opened DeepSeek yet
+      if (result.error === 'no_tab') {
+        sendResponse({
+          error: 'Please open https://chat.deepseek.com in a browser tab and log in there first, then try again here.\n\nThe extension reads your session from the open tab — no separate login needed.',
+        });
+        return;
+      }
+
+      // Tab found but token not in localStorage—DeepSeek may use a different storage key
+      if (result.error === 'not_found') {
+        sendResponse({
+          error: `A DeepSeek tab is open but the auth token could not be found in localStorage (scanned ${result.keysScanned} keys).\n\nPlease make sure you are fully logged in at https://chat.deepseek.com and then try again.`,
+        });
+        return;
+      }
+
+      // Script injection failed (permissions issue, etc.)
+      if (result.error === 'injection_failed' || result.error === 'script_error') {
+        // Fall back to cookie-based approach as last resort
+        console.warn('[DeepSeek] Tab injection failed, falling back to cookie header approach:', result.message);
+        const cookieStr = await getDeepSeekCookieStr();
+        sendResponse({
+          error: `Could not read the DeepSeek tab directly (${result.message}).\n\nDeepSeek's WAF is also blocking direct API calls. Please try:\n1) Reload the extension at chrome://extensions\n2) Make sure chat.deepseek.com is open and you are logged in\n3) Try again`,
+          diagnostic: { reason: result.error, cookieCount: cookieStr ? cookieStr.split(';').length : 0 },
+        });
+        return;
+      }
+
+      sendResponse({ error: `Unexpected error during login: ${JSON.stringify(result)}` });
     })();
     return true;
   }

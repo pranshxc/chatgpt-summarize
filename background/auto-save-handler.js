@@ -1,6 +1,9 @@
 // Auto-download handler
 // 1. Receives SUMMARY_AUTO_DOWNLOAD message from content script (manual trigger)
 // 2. Watches chrome.storage.onChanged for the key the extension uses to save summaries
+// 3. Handles DEEPSEEK_TOKEN_FROM_PAGE — saves token extracted from DeepSeek's localStorage
+// 4. Handles DEEPSEEK_LOGIN — legacy path with WAF diagnostics
+// 5. Handles GET_DEEPSEEK_COOKIES — legacy cookie fetch
 
 // ── Storage watcher ──────────────────────────────────────────────────────────
 chrome.storage.onChanged.addListener(function (changes, area) {
@@ -48,16 +51,13 @@ function looksLikeSummary(text) {
   return (text.match(/[a-zA-Z]{4,}/g) || []).length > 20;
 }
 
-// ── DeepSeek cookie helper ──────────────────────────────────────────────────
-// FIX: Use { url } instead of { domain } — the domain filter is unreliable in MV3.
-// Query multiple URLs to catch cookies set on root domain vs subdomain.
+// ── DeepSeek cookie helper (used by legacy GET_DEEPSEEK_COOKIES) ───────────────
 async function getDeepSeekCookieStr() {
   const urls = [
     'https://chat.deepseek.com',
     'https://www.deepseek.com',
     'https://deepseek.com',
   ];
-
   const seen = new Map();
   for (const url of urls) {
     try {
@@ -70,12 +70,7 @@ async function getDeepSeekCookieStr() {
       console.warn('[DeepSeek] cookie fetch failed for', url, e);
     }
   }
-
-  if (seen.size === 0) {
-    console.warn('[DeepSeek] No cookies found across all DeepSeek domains');
-    return null;
-  }
-
+  if (seen.size === 0) return null;
   const cookieStr = Array.from(seen.values()).map(c => `${c.name}=${c.value}`).join('; ');
   console.log('[DeepSeek] Collected', seen.size, 'unique cookies across DeepSeek domains');
   return cookieStr;
@@ -83,13 +78,29 @@ async function getDeepSeekCookieStr() {
 
 // ── Message handler ──────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
-  // Auto-download trigger from content script
+
+  // Auto-download trigger
   if (message && message.type === 'SUMMARY_AUTO_DOWNLOAD' && message.text) {
     doDownload(message.text, sender, sendResponse);
     return true;
   }
 
-  // Legacy: cookie-only fetch (kept for backward compat)
+  // ★ PRIMARY PATH: Token extracted directly from DeepSeek's localStorage by content script
+  // No API call, no WAF, no cookies needed. Works as long as user is logged in on chat.deepseek.com.
+  if (message && message.type === 'DEEPSEEK_TOKEN_FROM_PAGE') {
+    const { token } = message;
+    if (!token || token.length < 20) {
+      sendResponse({ saved: false, error: 'Invalid token received from page' });
+      return true;
+    }
+    chrome.storage.local.set({ 'deepseek-token': token }, () => {
+      console.log('[DeepSeek] Token saved from page localStorage. Length:', token.length);
+      sendResponse({ saved: true });
+    });
+    return true;
+  }
+
+  // Legacy: cookie-only fetch
   if (message && message.type === 'GET_DEEPSEEK_COOKIES') {
     getDeepSeekCookieStr().then(cookieStr => {
       sendResponse({ cookieStr: cookieStr || null });
@@ -97,113 +108,38 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
     return true;
   }
 
-  // Full background-owned DeepSeek login
-  // Runs from SW context to bypass CloudFront/WAF blocking of extension-origin requests
+  // Legacy: full background login attempt (WAF-blocked, kept for diagnostics)
   if (message && message.type === 'DEEPSEEK_LOGIN') {
     (async () => {
       try {
         const { email, password } = message;
 
+        // First, check if we already have a token saved from the page bridge
+        const stored = await chrome.storage.local.get({ 'deepseek-token': '' });
+        if (stored['deepseek-token'] && stored['deepseek-token'].length > 20) {
+          console.log('[DeepSeek] Using existing token from page bridge, skipping login API call.');
+          sendResponse({ token: stored['deepseek-token'] });
+          return;
+        }
+
+        // No page-bridge token available — instruct user to log in on the site
+        // (Direct API login is blocked by DeepSeek CloudFront WAF regardless of headers/cookies)
         const cookieStr = await getDeepSeekCookieStr();
-        console.log('[DeepSeek] Login attempt — cookies:', cookieStr ? cookieStr.split(';').length + ' found' : 'none');
-
-        // Mimic a real browser request from chat.deepseek.com to defeat WAF fingerprinting
-        const headers = {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'Origin': 'https://chat.deepseek.com',
-          'Referer': 'https://chat.deepseek.com/',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-          'sec-ch-ua-mobile': '?0',
-          'sec-ch-ua-platform': '"Windows"',
-          'sec-fetch-dest': 'empty',
-          'sec-fetch-mode': 'cors',
-          'sec-fetch-site': 'same-origin',
-          'x-app-version': '20241129.1',
-          'x-client-platform': 'web',
-          'x-client-locale': 'en_US',
-        };
-        if (cookieStr) headers['Cookie'] = cookieStr;
-
-        const res = await fetch('https://chat.deepseek.com/api/v0/users/login', {
-          method: 'POST',
-          headers,
-          credentials: 'omit',
-          body: JSON.stringify({
-            email,
-            password,
-            mobile: '',
-            area_code: '',
-            device_id: '',
-            os: 'web',
-          }),
-        });
-
-        const text = await res.text();
-        let data = null;
-        try { data = text ? JSON.parse(text) : null; } catch {}
-
-        const ct = res.headers.get('content-type') || '';
-        const wafAction = res.headers.get('x-amzn-waf-action') || '';
-
-        // WAF challenge detected — either empty body or HTML challenge page
-        if (wafAction === 'challenge' || (!text && res.status !== 200)) {
-          if (!cookieStr) {
-            sendResponse({
-              error: 'DeepSeek requires browser cookies to authenticate.\n\nPlease: 1) Open https://chat.deepseek.com in a tab, 2) Log in there, 3) Come back and try again here.',
-              diagnostic: { reason: 'waf_no_cookies', status: res.status, wafAction },
-            });
-          } else {
-            sendResponse({
-              error: `DeepSeek's WAF is actively blocking this login request (HTTP ${res.status}).\n\nThis is a server-side bot protection issue. Please:\n1) Open https://chat.deepseek.com\n2) Complete any CAPTCHA challenge\n3) Log in manually\n4) Then try again here.`,
-              diagnostic: { reason: 'waf_blocked_with_cookies', status: res.status, wafAction, cookieCount: cookieStr.split(';').length },
-            });
-          }
-          return;
-        }
-
-        if (!text) {
+        if (!cookieStr) {
           sendResponse({
-            error: `DeepSeek returned an empty response (HTTP ${res.status}). Please wait a moment and try again.`,
-            diagnostic: { reason: 'empty_body', status: res.status },
+            error: 'DeepSeek requires you to log in via the browser.\n\nPlease:\n1) Open https://chat.deepseek.com in a tab\n2) Log in there\n3) Come back and try again — the extension will automatically pick up your session.',
+            diagnostic: { reason: 'no_page_token_no_cookies' },
           });
           return;
         }
 
-        // HTML body = challenge page without WAF header
-        if (!ct.includes('application/json')) {
-          sendResponse({
-            error: 'DeepSeek is returning a bot-protection page instead of a login response.\n\nPlease open https://chat.deepseek.com, complete any CAPTCHA, log in, then try again.',
-            diagnostic: { reason: 'html_challenge', status: res.status, preview: text.slice(0, 200) },
-          });
-          return;
-        }
-
-        if (!res.ok) {
-          sendResponse({
-            error: data?.error || data?.detail?.message || data?.message || `Login failed (HTTP ${res.status}). Please check your credentials.`,
-            diagnostic: { reason: 'api_error', status: res.status },
-          });
-          return;
-        }
-
-        if (data?.data?.user?.token) {
-          await chrome.storage.local.set({
-            'deepseek-token': data.data.user.token,
-            'deepseek-login': email,
-            'deepseek-password': password,
-          });
-          sendResponse({ token: data.data.user.token });
-          return;
-        }
-
+        // Has cookies but no page token yet — user may be logged in but token bridge hasn\'t run
         sendResponse({
-          error: `DeepSeek login response has an unexpected format. The API may have changed.\n\nRaw preview: ${text.slice(0, 200)}`,
-          diagnostic: { reason: 'unexpected_shape', status: res.status },
+          error: 'Your DeepSeek session was detected but the token bridge has not run yet.\n\nPlease:\n1) Make sure https://chat.deepseek.com is open in a tab\n2) Refresh that tab\n3) Try again here',
+          diagnostic: { reason: 'cookies_but_no_page_token', cookieCount: cookieStr.split(';').length },
         });
       } catch (err) {
-        sendResponse({ error: err?.message || 'DeepSeek login failed in background worker' });
+        sendResponse({ error: err?.message || 'DeepSeek login failed' });
       }
     })();
     return true;

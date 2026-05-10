@@ -4,7 +4,7 @@
   "name": "__MSG_appName__",
   "description": "__MSG_appDesc__",
   "default_locale": "en",
-  "version": "1.9.4",
+  "version": "1.9.5",
   "manifest_version": 3,
   "icons": {
     "16": "logo-16.png",
@@ -46,6 +46,11 @@
       "js": ["content-script/index.js", "content-script/auto-save.js"],
       "run_at": "document_idle",
       "css": ["styles.css"]
+    },
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["content-script/deepseek-token-bridge.js"],
+      "run_at": "document_idle"
     }
   ],
   "web_accessible_resources": [

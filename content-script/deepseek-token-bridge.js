@@ -1,106 +1,89 @@
 // DeepSeek Token Bridge
-// Injected on chat.deepseek.com — reads the auth token directly from
-// DeepSeek's localStorage so we never need to call the login API at all.
-// This completely sidesteps CloudFront WAF challenge blocking.
-(function () {
-  if (window.__deepseekTokenBridgeLoaded) return;
-  window.__deepseekTokenBridgeLoaded = true;
+// Runs as a content script on https://chat.deepseek.com/*
+// Proactively extracts the auth token from localStorage and pushes it
+// to the background SW via chrome.runtime.sendMessage.
+// This is the only reliable way to get the token — DeepSeek's login API
+// is blocked by AWS CloudFront WAF for any non-browser origin.
 
-  function extractToken() {
-    try {
-      // DeepSeek stores session data in localStorage under these known keys
-      const candidates = [
-        'userToken',
-        'user_token',
-        'token',
-        'accessToken',
-        'access_token',
-        'deepseek_token',
-        'auth_token',
-      ];
+(function extractAndSendToken() {
+  const candidates = [
+    'userToken',
+    'token',
+    'accessToken',
+    'access_token',
+    'authToken',
+    'auth_token',
+    'ds_token',
+  ];
 
-      // Direct key check
-      for (const key of candidates) {
-        const val = localStorage.getItem(key);
-        if (val && val.length > 20 && !val.startsWith('{')) return val;
+  function findToken() {
+    // 1. Direct key lookup
+    for (const key of candidates) {
+      const val = localStorage.getItem(key);
+      if (val && val.length > 20) return { token: val, source: key };
+    }
+
+    // 2. Scan all localStorage entries
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      const val = localStorage.getItem(key);
+      if (!val) continue;
+
+      // JWT pattern: three base64url segments
+      if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(val)) {
+        return { token: val, source: key };
       }
 
-      // JSON-encoded objects in localStorage (e.g. { token: '...' })
-      for (let i = 0; i < localStorage.length; i++) {
-        const key = localStorage.key(i);
+      // JSON object containing a token field
+      if (val.startsWith('{')) {
         try {
-          const raw = localStorage.getItem(key);
-          if (!raw || raw.length < 20) continue;
-          const parsed = JSON.parse(raw);
-          if (parsed && typeof parsed === 'object') {
-            for (const field of ['token', 'userToken', 'access_token', 'accessToken', 'biz_data']) {
-              if (parsed[field] && typeof parsed[field] === 'string' && parsed[field].length > 20) {
-                return parsed[field];
-              }
-              // Nested: { data: { user: { token } } }
-              if (parsed[field] && typeof parsed[field] === 'object') {
-                const nested = parsed[field];
-                for (const sub of ['token', 'userToken', 'access_token']) {
-                  if (nested[sub] && typeof nested[sub] === 'string' && nested[sub].length > 20) {
-                    return nested[sub];
-                  }
-                }
-              }
+          const parsed = JSON.parse(val);
+          for (const field of ['token', 'access_token', 'accessToken', 'userToken', 'authToken', 'biz_token']) {
+            if (parsed[field] && typeof parsed[field] === 'string' && parsed[field].length > 20) {
+              return { token: parsed[field], source: `${key}.${field}` };
             }
           }
         } catch {}
       }
-    } catch (e) {
-      console.warn('[DeepSeekBridge] localStorage read failed:', e);
     }
+
     return null;
   }
 
-  function sendTokenToBackground(token) {
-    chrome.runtime.sendMessage(
-      { type: 'DEEPSEEK_TOKEN_FROM_PAGE', token },
-      response => {
-        if (chrome.runtime.lastError) {
-          console.warn('[DeepSeekBridge] sendMessage error:', chrome.runtime.lastError.message);
-          return;
-        }
-        if (response && response.saved) {
-          console.log('[DeepSeekBridge] Token saved to extension storage successfully.');
-        }
-      }
-    );
+  function sendToken(result) {
+    if (!result || !result.token) return;
+    try {
+      chrome.runtime.sendMessage(
+        { type: 'DEEPSEEK_TOKEN_FROM_PAGE', token: result.token, source: result.source },
+        () => { if (chrome.runtime.lastError) {} } // suppress error if SW is asleep
+      );
+      console.log('[DeepSeek Bridge] Token sent to background from localStorage key:', result.source);
+    } catch (e) {
+      console.warn('[DeepSeek Bridge] Could not send token:', e.message);
+    }
   }
 
-  // Try immediately on load
-  const token = extractToken();
-  if (token) {
-    console.log('[DeepSeekBridge] Token found on page load, sending to background.');
-    sendTokenToBackground(token);
+  // Try immediately (page already loaded)
+  const immediate = findToken();
+  if (immediate) {
+    sendToken(immediate);
     return;
   }
 
-  // If not found immediately, watch localStorage via storage event
-  // (fires when DeepSeek writes the token after login completes)
-  window.addEventListener('storage', function onStorage(e) {
-    const token = extractToken();
-    if (token) {
-      console.log('[DeepSeekBridge] Token found after storage event, sending to background.');
-      sendTokenToBackground(token);
-      window.removeEventListener('storage', onStorage);
-    }
-  });
-
-  // Also poll briefly for SPA login flows that don't fire storage events
+  // If not found yet, wait for page to fully initialize and try again
+  // DeepSeek is a SPA — token may be written to localStorage after React hydration
   let attempts = 0;
-  const poll = setInterval(() => {
+  const interval = setInterval(() => {
     attempts++;
-    const token = extractToken();
-    if (token) {
-      console.log('[DeepSeekBridge] Token found after polling, sending to background.');
-      sendTokenToBackground(token);
-      clearInterval(poll);
+    const result = findToken();
+    if (result) {
+      clearInterval(interval);
+      sendToken(result);
       return;
     }
-    if (attempts >= 20) clearInterval(poll); // stop after 10 seconds
+    if (attempts >= 20) { // give up after 10 seconds
+      clearInterval(interval);
+      console.warn('[DeepSeek Bridge] Token not found in localStorage after 10s');
+    }
   }, 500);
 })();

@@ -49,16 +49,12 @@ function looksLikeSummary(text) {
 }
 
 // ── DeepSeek cookie helper ────────────────────────────────────────────────────
-// Uses chrome.cookies (MV3) to read whatever cookies the user's browser already
-// has for DeepSeek after they logged in normally at chat.deepseek.com.
-// No login API call is ever made — we just piggyback on the existing session.
 async function getDeepSeekCookieStr() {
   const urls = [
     'https://chat.deepseek.com',
     'https://www.deepseek.com',
     'https://deepseek.com',
   ];
-
   const seen = new Map();
   for (const url of urls) {
     try {
@@ -71,27 +67,21 @@ async function getDeepSeekCookieStr() {
       console.warn('[DeepSeek] cookie fetch failed for', url, e);
     }
   }
-
-  if (seen.size === 0) {
-    console.warn('[DeepSeek] No cookies found — user needs to log in at chat.deepseek.com first');
-    return null;
-  }
-
+  if (seen.size === 0) return null;
   const cookieStr = Array.from(seen.values()).map(c => `${c.name}=${c.value}`).join('; ');
   console.log('[DeepSeek] Collected', seen.size, 'unique cookies across DeepSeek domains');
   return cookieStr;
 }
 
-// ── Message handler ───────────────────────────────────────────────────────────
+// ── Message handler ──────────────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
 
-  // Auto-download trigger from content script
   if (message && message.type === 'SUMMARY_AUTO_DOWNLOAD' && message.text) {
     doDownload(message.text, sender, sendResponse);
     return true;
   }
 
-  // Cookie fetch (used by chunk-LBLDOCW3.js getDeepSeekCookies)
+  // Cookie fetch used by other parts of the extension
   if (message && message.type === 'GET_DEEPSEEK_COOKIES') {
     getDeepSeekCookieStr().then(cookieStr => {
       sendResponse({ cookieStr: cookieStr || null });
@@ -99,93 +89,20 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
     return true;
   }
 
-  // DEEPSEEK_LOGIN
-  // ─────────────────────────────────────────────────────────────────────────
-  // NEW APPROACH: We do NOT call the login API at all.
-  //
-  // DeepSeek's login endpoint (https://chat.deepseek.com/api/v0/users/login)
-  // is protected by AWS CloudFront WAF which rejects any request not coming
-  // from a real browser (TLS fingerprint + HTTP/2 frame checks). There is no
-  // way to bypass this from a service worker or extension background page.
-  //
-  // Instead: the user logs in once normally at https://chat.deepseek.com.
-  // Their browser stores a session cookie (typically named "userToken" or a
-  // similar auth cookie). We read those cookies via chrome.cookies and attach
-  // them to every outgoing DeepSeek API request.
-  //
-  // This means:
-  //   • No email/password is needed by the extension
-  //   • No login network request is ever made
-  //   • The WAF is never triggered
-  //   • Session automatically inherits the user's logged-in state
-  // ─────────────────────────────────────────────────────────────────────────
+  // DEEPSEEK_LOGIN — reads browser cookies from existing DeepSeek session.
+  // No email/password. No login API call. No WAF.
+  // User just needs to be logged in at https://chat.deepseek.com already.
   if (message && message.type === 'DEEPSEEK_LOGIN') {
     (async () => {
       const cookieStr = await getDeepSeekCookieStr();
-
       if (!cookieStr) {
         sendResponse({
-          error: 'Not logged in to DeepSeek.\n\nPlease open https://chat.deepseek.com in a new tab, log in with your account, then come back and click Connect again.',
+          error: 'Not logged in to DeepSeek.\n\nPlease open https://chat.deepseek.com in a tab, log in, then click Connect again.',
         });
         return;
       }
-
-      // Store cookie string so chunk-LBLDOCW3.js can use it for API calls
-      await chrome.storage.local.set({ 'deepseek-cookie': cookieStr });
-
-      // Verify the session is valid by calling a lightweight authenticated endpoint
-      try {
-        const res = await fetch('https://chat.deepseek.com/api/v0/users/current', {
-          method: 'GET',
-          headers: {
-            'Cookie': cookieStr,
-            'Accept': 'application/json',
-            'x-app-version': '20241129.1',
-            'x-client-platform': 'web',
-          },
-          credentials: 'omit',
-        });
-
-        const text = await res.text();
-        let data = null;
-        try { data = text ? JSON.parse(text) : null; } catch {}
-
-        // WAF challenge or empty body — cookies exist but aren't being forwarded
-        // to the API (this is a browser security restriction — Cookie header is
-        // not sent by service workers to 3rd-party origins in all browsers).
-        // In that case, skip verification and trust the cookies are valid.
-        if (!text || (res.status === 200 && !data)) {
-          console.warn('[DeepSeek] Session check returned empty — proceeding with cookies anyway');
-          sendResponse({ cookieStr, skippedVerify: true });
-          return;
-        }
-
-        if (!res.ok || data?.code !== 0) {
-          sendResponse({
-            error: `DeepSeek session is expired or invalid (HTTP ${res.status}).\n\nPlease log in again at https://chat.deepseek.com and then click Connect.`,
-          });
-          return;
-        }
-
-        // Success — store user info if available
-        const user = data?.data?.user;
-        if (user) {
-          await chrome.storage.local.set({
-            'deepseek-user': user,
-            // Also store token if the /current endpoint returns one
-            ...(user.token ? { 'deepseek-token': user.token } : {}),
-          });
-        }
-
-        console.log('[DeepSeek] Session verified via cookies. User:', user?.email || user?.nickname || 'unknown');
-        sendResponse({ cookieStr, user: user || null });
-
-      } catch (err) {
-        // Network error during verification — still return the cookies
-        // so the extension can attempt API calls
-        console.warn('[DeepSeek] Session verify failed (network):', err.message);
-        sendResponse({ cookieStr, skippedVerify: true });
-      }
+      console.log('[DeepSeek] Returning cookie session to popup');
+      sendResponse({ cookieStr });
     })();
     return true;
   }

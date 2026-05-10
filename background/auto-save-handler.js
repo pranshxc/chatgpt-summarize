@@ -49,8 +49,8 @@ function looksLikeSummary(text) {
 }
 
 // ── DeepSeek cookie helper ──────────────────────────────────────────────────
-// FIX: chrome.cookies.getAll({ domain }) is unreliable for subdomains in MV3.
-// Use { url } instead, and query multiple URLs to catch all cookie scopes.
+// FIX: Use { url } instead of { domain } — the domain filter is unreliable in MV3.
+// Query multiple URLs to catch cookies set on root domain vs subdomain.
 async function getDeepSeekCookieStr() {
   const urls = [
     'https://chat.deepseek.com',
@@ -89,7 +89,7 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
     return true;
   }
 
-  // Legacy: cookie-only fetch (used by chunk-LBLDOCW3.js getDeepSeekCookies)
+  // Legacy: cookie-only fetch (kept for backward compat)
   if (message && message.type === 'GET_DEEPSEEK_COOKIES') {
     getDeepSeekCookieStr().then(cookieStr => {
       sendResponse({ cookieStr: cookieStr || null });
@@ -97,26 +97,35 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
     return true;
   }
 
-  // Full background-owned DeepSeek login (most robust path)
+  // Full background-owned DeepSeek login
+  // Runs from SW context to bypass CloudFront/WAF blocking of extension-origin requests
   if (message && message.type === 'DEEPSEEK_LOGIN') {
     (async () => {
       try {
         const { email, password } = message;
 
-        // 1. Collect cookies from all DeepSeek domains
         const cookieStr = await getDeepSeekCookieStr();
+        console.log('[DeepSeek] Login attempt — cookies:', cookieStr ? cookieStr.split(';').length + ' found' : 'none');
 
-        // 2. Build headers
+        // Mimic a real browser request from chat.deepseek.com to defeat WAF fingerprinting
         const headers = {
           'Content-Type': 'application/json',
           'Accept': 'application/json',
+          'Origin': 'https://chat.deepseek.com',
+          'Referer': 'https://chat.deepseek.com/',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+          'sec-ch-ua-mobile': '?0',
+          'sec-ch-ua-platform': '"Windows"',
+          'sec-fetch-dest': 'empty',
+          'sec-fetch-mode': 'cors',
+          'sec-fetch-site': 'same-origin',
           'x-app-version': '20241129.1',
           'x-client-platform': 'web',
           'x-client-locale': 'en_US',
         };
         if (cookieStr) headers['Cookie'] = cookieStr;
 
-        // 3. Fire login request from background (avoids CORS/origin issues)
         const res = await fetch('https://chat.deepseek.com/api/v0/users/login', {
           method: 'POST',
           headers,
@@ -135,35 +144,42 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
         let data = null;
         try { data = text ? JSON.parse(text) : null; } catch {}
 
-        // Diagnostic: blank body + no cookies = user hasn't logged in via browser
-        if (!text && !cookieStr) {
-          sendResponse({
-            error: 'DeepSeek requires browser cookies to authenticate.\n\nPlease: 1) Open https://chat.deepseek.com in a tab, 2) Log in there, 3) Come back and try again here.',
-            diagnostic: { reason: 'no_cookies', status: res.status },
-          });
-          return;
-        }
-
-        // Diagnostic: blank body despite having cookies = WAF/rate-limit
-        if (!text && cookieStr) {
-          sendResponse({
-            error: `DeepSeek returned an empty response (HTTP ${res.status}) even with ${cookieStr.split(';').length} cookies present.\n\nThis usually means DeepSeek is rate-limiting or blocking the request. Please wait a moment and try again.`,
-            diagnostic: { reason: 'empty_body_with_cookies', status: res.status },
-          });
-          return;
-        }
-
-        // Diagnostic: HTML body = WAF challenge page
         const ct = res.headers.get('content-type') || '';
-        if (!ct.includes('application/json') && text) {
+        const wafAction = res.headers.get('x-amzn-waf-action') || '';
+
+        // WAF challenge detected — either empty body or HTML challenge page
+        if (wafAction === 'challenge' || (!text && res.status !== 200)) {
+          if (!cookieStr) {
+            sendResponse({
+              error: 'DeepSeek requires browser cookies to authenticate.\n\nPlease: 1) Open https://chat.deepseek.com in a tab, 2) Log in there, 3) Come back and try again here.',
+              diagnostic: { reason: 'waf_no_cookies', status: res.status, wafAction },
+            });
+          } else {
+            sendResponse({
+              error: `DeepSeek's WAF is actively blocking this login request (HTTP ${res.status}).\n\nThis is a server-side bot protection issue. Please:\n1) Open https://chat.deepseek.com\n2) Complete any CAPTCHA challenge\n3) Log in manually\n4) Then try again here.`,
+              diagnostic: { reason: 'waf_blocked_with_cookies', status: res.status, wafAction, cookieCount: cookieStr.split(';').length },
+            });
+          }
+          return;
+        }
+
+        if (!text) {
           sendResponse({
-            error: 'DeepSeek is returning a bot-protection page instead of a login response.\n\nPlease open https://chat.deepseek.com, solve any CAPTCHA, log in, then try again.',
+            error: `DeepSeek returned an empty response (HTTP ${res.status}). Please wait a moment and try again.`,
+            diagnostic: { reason: 'empty_body', status: res.status },
+          });
+          return;
+        }
+
+        // HTML body = challenge page without WAF header
+        if (!ct.includes('application/json')) {
+          sendResponse({
+            error: 'DeepSeek is returning a bot-protection page instead of a login response.\n\nPlease open https://chat.deepseek.com, complete any CAPTCHA, log in, then try again.',
             diagnostic: { reason: 'html_challenge', status: res.status, preview: text.slice(0, 200) },
           });
           return;
         }
 
-        // API error
         if (!res.ok) {
           sendResponse({
             error: data?.error || data?.detail?.message || data?.message || `Login failed (HTTP ${res.status}). Please check your credentials.`,
@@ -172,7 +188,6 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
           return;
         }
 
-        // Success
         if (data?.data?.user?.token) {
           await chrome.storage.local.set({
             'deepseek-token': data.data.user.token,
@@ -183,7 +198,6 @@ chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
           return;
         }
 
-        // Unexpected shape (API may have changed)
         sendResponse({
           error: `DeepSeek login response has an unexpected format. The API may have changed.\n\nRaw preview: ${text.slice(0, 200)}`,
           diagnostic: { reason: 'unexpected_shape', status: res.status },

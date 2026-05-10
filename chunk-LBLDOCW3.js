@@ -12,21 +12,21 @@ async function safeJson(response){
   catch(e){console.error("[safeJson] JSON parse failed:",text.slice(0,300));throw new Error("Server returned invalid response")}
 }
 
-// Must go through background SW because chrome.cookies is only available there
-function getDeepSeekCookies(){
+// Route login entirely through background SW — popup/content fetch is blocked by DeepSeek WAF
+function deepseekLoginViaBackground(email, password){
   return new Promise(resolve=>{
     try{
-      chrome.runtime.sendMessage({type:"GET_DEEPSEEK_COOKIES"},response=>{
+      chrome.runtime.sendMessage({type:"DEEPSEEK_LOGIN",email,password},response=>{
         if(chrome.runtime.lastError){
           console.warn("[DeepSeek] sendMessage error:",chrome.runtime.lastError.message);
-          resolve(null);
+          resolve({error:"Background login failed: "+chrome.runtime.lastError.message});
           return;
         }
-        resolve(response?.cookieStr||null);
+        resolve(response||{error:"No response from background worker"});
       });
     }catch(e){
-      console.warn("[DeepSeek] getDeepSeekCookies failed:",e);
-      resolve(null);
+      console.warn("[DeepSeek] deepseekLoginViaBackground failed:",e);
+      resolve({error:e?.message||"Unable to start DeepSeek login"});
     }
   });
 }
@@ -57,54 +57,13 @@ async function A(e,t){
       e=o["deepseek-login"],t=o["deepseek-password"]
     }
 
-    const cookieStr=await getDeepSeekCookies();
-    console.log("[DeepSeek] cookies found:",cookieStr?"yes (length "+cookieStr.length+")":"none");
-
-    const headers={
-      "Content-Type":"application/json",
-      "Accept":"application/json",
-      "x-app-version":"20241129.1",
-      "x-client-platform":"web",
-      "x-client-locale":"en_US"
-    };
-    if(cookieStr)headers["Cookie"]=cookieStr;
-
-    let r=await fetch(P.loginUrl,{
-      method:"POST",
-      headers,
-      credentials:"omit",
-      body:JSON.stringify({email:e,password:t,mobile:"",area_code:"",device_id:"",os:"web"})
-    });
-
-    let n;
-    try{n=await safeJson(r)}
-    catch(parseErr){return{error:"Server returned an unreadable response. Please try again."}}
-
-    // Detect WAF/bot challenge: non-JSON HTML body
-    if(n&&n.__rawHtml__!==undefined){
-      return{error:"DeepSeek is blocking this request (bot protection).\n\nPlease open https://chat.deepseek.com in your browser, log in there first, then try again here."}
+    // Delegate entirely to background SW — direct fetch from popup is blocked by DeepSeek CloudFront WAF
+    const result=await deepseekLoginViaBackground(e,t);
+    if(result&&"token" in result){
+      await f.default.storage.local.set({"deepseek-token":result.token,"deepseek-login":e,"deepseek-password":t});
+      return{token:result.token}
     }
-
-    // Blank body — WAF challenge with empty response
-    if(n===null){
-      if(!cookieStr){
-        return{error:"DeepSeek requires browser cookies to authenticate.\n\nPlease: 1) Open https://chat.deepseek.com in a tab, 2) Log in there, 3) Come back and try again here."}
-      }
-      return{error:`Login returned empty response (${r.status}). DeepSeek may be rate-limiting or blocking this request. Please wait a moment and try again.`}
-    }
-
-    if(!r.ok){
-      return{error:n?.error||n?.detail?.message||n?.message||`Login failed (${r.status}). Please check your credentials.`}
-    }
-
-    if(r.ok&&n?.data?.user){
-      let o=n.data.user.token;
-      await f.default.storage.local.set({"deepseek-token":o,"deepseek-login":e,"deepseek-password":t});
-      return{token:o}
-    }else{
-      console.warn("[DeepSeek] ok but unexpected response shape:",JSON.stringify(n).slice(0,300));
-      return{error:n?.error||n?.message||`Unexpected response from DeepSeek (${r.status}). Raw: `+JSON.stringify(n).slice(0,150)}
-    }
+    return{error:result?.error||"DeepSeek login failed. Please try again."}
   }catch(r){
     return console.error("Login error",r),{error:r?.message||"An error occurred during login"}
   }
